@@ -32,6 +32,7 @@ token_stats.py — AI Token 统计悬浮窗（小体积单文件方案）
 """
 import argparse
 import json
+import math
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -66,6 +67,17 @@ THEMES = {
 }
 THEME_ORDER = ["dark", "light", "neon", "minimal"]
 THEME_NAMES_CN = {"dark": "深色", "light": "浅色", "neon": "霓虹", "minimal": "极简"}
+
+# ---------------- Token 类型明细：圆环细分与面板共用的配色/中文名 ----------------
+# 固定配色（跨主题统一，便于一眼区分各成分），顺序即圆环从顶端顺时针的排列
+TYPE_KEYS = ["input", "cache_create", "cached_read", "output", "reasoning"]
+TYPE_META = {
+    "input":        {"cn": "非缓存输入", "color": "#5b8def"},
+    "cache_create": {"cn": "缓存创建", "color": "#e0a63b"},
+    "cached_read":  {"cn": "缓存读",   "color": "#2bb6a3"},
+    "output":       {"cn": "普通输出", "color": "#4caf72"},
+    "reasoning":    {"cn": "推理输出", "color": "#9b6dde"},
+}
 
 
 def _number(value, default, minimum, maximum, cast):
@@ -168,6 +180,48 @@ def sub_bucket(b, d):
     for k in ("input", "cached_read", "cache_create", "output", "reasoning", "total"):
         b[k] -= d[k]
     b["events"] -= 1
+
+
+def component_sum(bucket):
+    """汇总互斥展示成分；缓存和推理不得与其父级字段重复相加。"""
+    return sum(nn(bucket.get(k)) for k in TYPE_KEYS)
+
+
+def without_cached_read(bucket):
+    """返回不含缓存读取的 Token；缓存创建仍属于本次新处理输入。"""
+    return max(0, nn(bucket.get("total")) - nn(bucket.get("cached_read")))
+
+
+def display_bucket(source, bucket):
+    """把来源原始统计转换为可相加的互斥展示成分。"""
+    out = zero_bucket()
+    out["total"] = nn(bucket.get("total"))
+    out["events"] = nn(bucket.get("events"))
+
+    if source == "codex":
+        # Codex 的 cached_input_tokens 包含在 input_tokens 内，
+        # reasoning_output_tokens 包含在 output_tokens 内，展示时必须扣除父级重叠。
+        raw_input = nn(bucket.get("input"))
+        raw_output = nn(bucket.get("output"))
+        out["cached_read"] = min(nn(bucket.get("cached_read")), raw_input)
+        out["reasoning"] = min(nn(bucket.get("reasoning")), raw_output)
+        out["input"] = raw_input - out["cached_read"]
+        out["output"] = raw_output - out["reasoning"]
+        return out
+
+    # Claude Code 的输入、缓存创建、缓存读取、输出是互斥字段。
+    for key in TYPE_KEYS:
+        out[key] = nn(bucket.get(key))
+    return out
+
+
+def merge_buckets(*buckets):
+    """合并已经标准化为互斥成分的多个统计桶。"""
+    out = zero_bucket()
+    for bucket in buckets:
+        for key in out:
+            out[key] += nn(bucket.get(key))
+    return out
 
 
 def collect_jsonl(root: str, days: int, name_prefix: str = ""):
@@ -438,7 +492,13 @@ def gui_main(cfg):
                         highlightthickness=0, bd=0)
     canvas.pack()
 
-    state = {"claude_total": 0, "codex_total": 0, "at": "--", "rl": None, "err": None}
+    state = {"claude": zero_bucket(), "codex": zero_bucket(),
+             "at": "--", "rl": None, "err": None}
+
+    # 悬停细分状态：zone 为当前悬停区域（claude/codex/combined），None 为默认合并视图
+    hover = {"zone": None}
+    drag_active = {"on": False}
+    panel = {"win": None, "canvas": None}
 
     # 贴边自动隐藏状态：edge 为贴住的屏幕边（拖动松手时判定），非贴边时为 None
     edge_state = {"edge": None, "hidden": False, "hide_timer": None, "anim_job": None}
@@ -450,52 +510,105 @@ def gui_main(cfg):
             return f"{n / 1_000:.1f}K"
         return str(n)
 
+    # ---- Token 明细：圆环细分与面板共用 ----
+    def type_sum(bucket):
+        return component_sum(bucket)
+
+    def bucket_for(zone):
+        if zone == "claude":
+            return display_bucket("claude", state["claude"])
+        if zone == "codex":
+            return display_bucket("codex", state["codex"])
+        return merge_buckets(
+            display_bucket("claude", state["claude"]),
+            display_bucket("codex", state["codex"]),
+        )
+
     # ---- 绘制圆形表盘 ----
     def draw():
         canvas.delete("all")
         th = theme()
         c = DIAMETER
         cx = c / 2
+        bbox = (MARGIN, MARGIN, c - MARGIN, c - MARGIN)
 
         # 未用量轨道环
-        canvas.create_oval(MARGIN, MARGIN, c - MARGIN, c - MARGIN,
-                            outline=th["track"], width=RING_WIDTH)
+        canvas.create_oval(*bbox, outline=th["track"], width=RING_WIDTH)
 
-        claude_t, codex_t = state["claude_total"], state["codex_total"]
-        total = claude_t + codex_t
-        bbox = (MARGIN, MARGIN, c - MARGIN, c - MARGIN)
-        if total > 0:
-            if codex_t <= 0:
-                canvas.create_arc(*bbox, start=90, extent=-359.9,
-                                   style="arc", outline=th["claude"], width=RING_WIDTH)
-            elif claude_t <= 0:
-                canvas.create_arc(*bbox, start=90, extent=-359.9,
-                                   style="arc", outline=th["codex"], width=RING_WIDTH)
-            else:
-                claude_deg = max(2.0, min(358.0, 360 * claude_t / total))
-                codex_deg = 360 - claude_deg
-                canvas.create_arc(*bbox, start=90, extent=-claude_deg,
-                                   style="arc", outline=th["claude"], width=RING_WIDTH)
-                canvas.create_arc(*bbox, start=90 - claude_deg, extent=-codex_deg,
-                                   style="arc", outline=th["codex"], width=RING_WIDTH)
+        mode = hover["zone"] or "split"
+        if mode == "split":
+            draw_split_ring(th, bbox)
+        else:
+            draw_type_ring(bucket_for(mode), bbox)
 
         # 内部表盘面
         face_inset = MARGIN + RING_WIDTH + 4
         canvas.create_oval(face_inset, face_inset, c - face_inset, c - face_inset,
                             fill=th["face"], outline=th["face"])
 
-        canvas.create_text(cx, cx - 16, text=fmt_k(total), fill=th["fg"],
-                            font=("Segoe UI", 15, "bold"))
-        canvas.create_text(cx, cx + 6, text=f"C {fmt_k(claude_t)}", fill=th["claude"],
-                            font=("Consolas", 9))
-        canvas.create_text(cx, cx + 20, text=f"X {fmt_k(codex_t)}", fill=th["codex"],
-                            font=("Consolas", 9))
+        draw_center(th, cx, mode)
         if state["err"]:
             canvas.create_text(cx, cx + 34, text="⚠ 错误", fill="#ff5555",
                                 font=("Segoe UI", 8))
 
         if edge_state["hidden"] and edge_state["edge"]:
             draw_edge_handle(th, c, cx)
+
+    # 默认视图：外环按 Claude / Codex 用量占比分色
+    def draw_split_ring(th, bbox):
+        claude_t = state["claude"]["total"]
+        codex_t = state["codex"]["total"]
+        total = claude_t + codex_t
+        if total <= 0:
+            return
+        if codex_t <= 0:
+            canvas.create_arc(*bbox, start=90, extent=-359.9,
+                               style="arc", outline=th["claude"], width=RING_WIDTH)
+        elif claude_t <= 0:
+            canvas.create_arc(*bbox, start=90, extent=-359.9,
+                               style="arc", outline=th["codex"], width=RING_WIDTH)
+        else:
+            claude_deg = max(2.0, min(358.0, 360 * claude_t / total))
+            codex_deg = 360 - claude_deg
+            canvas.create_arc(*bbox, start=90, extent=-claude_deg,
+                               style="arc", outline=th["claude"], width=RING_WIDTH)
+            canvas.create_arc(*bbox, start=90 - claude_deg, extent=-codex_deg,
+                               style="arc", outline=th["codex"], width=RING_WIDTH)
+
+    # 悬停视图：外环按互斥的输入/缓存/输出/推理成分细分
+    def draw_type_ring(bucket, bbox):
+        total = type_sum(bucket)
+        if total <= 0:
+            return
+        start = 90.0
+        for k in TYPE_KEYS:
+            v = nn(bucket.get(k))
+            if v <= 0:
+                continue
+            deg = 360 * v / total
+            canvas.create_arc(*bbox, start=start, extent=-min(359.9, deg),
+                               style="arc", outline=TYPE_META[k]["color"], width=RING_WIDTH)
+            start -= deg
+
+    # 圆心文字：只显示含缓存总数；不含缓存读取及分类仅在悬浮面板展示
+    def draw_center(th, cx, mode):
+        if mode == "split":
+            claude_t = state["claude"]["total"]
+            codex_t = state["codex"]["total"]
+            canvas.create_text(cx, cx - 16, text=fmt_k(claude_t + codex_t), fill=th["fg"],
+                                font=("Segoe UI", 15, "bold"))
+            canvas.create_text(cx, cx + 6, text=f"C {fmt_k(claude_t)}", fill=th["claude"],
+                                font=("Consolas", 9))
+            canvas.create_text(cx, cx + 20, text=f"X {fmt_k(codex_t)}", fill=th["codex"],
+                                font=("Consolas", 9))
+            return
+        label = {"claude": "Claude", "codex": "Codex", "combined": "合计"}[mode]
+        color = {"claude": th["claude"], "codex": th["codex"], "combined": th["fg"]}[mode]
+        bucket = bucket_for(mode)
+        canvas.create_text(cx, cx - 10, text=label, fill=color,
+                            font=("Segoe UI", 11, "bold"))
+        canvas.create_text(cx, cx + 10, text=fmt_k(bucket["total"]), fill=th["fg"],
+                            font=("Segoe UI", 14, "bold"))
 
     # ---- 贴边隐藏时露出的细条把手（保证透明窗口下仍有可悬停区域）----
     def draw_edge_handle(th, c, cx):
@@ -521,6 +634,11 @@ def gui_main(cfg):
 
     def on_press(e):
         drag["x"], drag["y"] = e.x, e.y
+        drag_active["on"] = True
+        if hover["zone"] is not None:
+            hover["zone"] = None
+            hide_panel()
+            draw()
 
     def on_move(e):
         if cfg["locked"]:
@@ -530,6 +648,7 @@ def gui_main(cfg):
         root.geometry(f"+{x}+{y}")
 
     def on_release(_):
+        drag_active["on"] = False
         cfg["x"], cfg["y"] = root.winfo_x(), root.winfo_y()
         save_config(cfg)
         cancel_hide_timer()
@@ -624,20 +743,166 @@ def gui_main(cfg):
             begin_show()
 
     def on_canvas_leave(_):
+        if hover["zone"] is not None:
+            hover["zone"] = None
+            hide_panel()
+            draw()
         start_hide_timer()
 
     canvas.bind("<Enter>", on_canvas_enter)
     canvas.bind("<Leave>", on_canvas_leave)
 
+    # ---- 悬停细分：移到某段圆环即弹出该来源/成分的明细面板 ----
+    def zone_at(ex, ey):
+        cx = DIAMETER / 2
+        dx, dy = ex - cx, ey - cx
+        r = math.hypot(dx, dy)
+        face_inset = MARGIN + RING_WIDTH + 4
+        inner_r = (DIAMETER - 2 * face_inset) / 2
+        outer_r = (DIAMETER - 2 * MARGIN) / 2 + RING_WIDTH / 2
+        if r > outer_r:
+            return None                       # 圆形之外（透明区）
+        if r <= inner_r:
+            return "combined"                 # 圆心 → 合并成分视图
+        claude_t = state["claude"]["total"]
+        codex_t = state["codex"]["total"]
+        total = claude_t + codex_t
+        if total <= 0:
+            return "combined"
+        if codex_t <= 0:
+            return "claude"
+        if claude_t <= 0:
+            return "codex"
+        ang = math.degrees(math.atan2(-dy, dx)) % 360   # 0=右, 90=上
+        claude_deg = max(2.0, min(358.0, 360 * claude_t / total))
+        delta = (90 - ang) % 360              # 自顶端顺时针的角度
+        return "claude" if delta <= claude_deg else "codex"
+
+    def on_motion(e):
+        if drag_active["on"] or edge_state["hidden"] or edge_state["anim_job"] is not None:
+            return
+        z = zone_at(e.x, e.y)
+        if z == hover["zone"]:
+            return
+        hover["zone"] = z
+        draw()
+        if z is None:
+            hide_panel()
+        else:
+            show_panel(z)
+
+    canvas.bind("<Motion>", on_motion)
+
+    # ---- 明细面板（独立无边框窗口，作为悬停浮层）----
+    def ensure_panel():
+        if panel["win"] is not None:
+            return
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        pcv = tk.Canvas(win, highlightthickness=0, bd=0)
+        pcv.pack()
+        panel["win"], panel["canvas"] = win, pcv
+        win.withdraw()
+
+    def hide_panel():
+        if panel["win"] is not None:
+            panel["win"].withdraw()
+
+    def place_panel(W, H):
+        root.update_idletasks()
+        rx, ry = root.winfo_rootx(), root.winfo_rooty()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        gap = 10
+        x = rx + DIAMETER + gap
+        if x + W > sw:                        # 右侧放不下就贴左侧
+            x = rx - W - gap
+        x = max(0, min(x, sw - W))
+        y = ry + DIAMETER // 2 - H // 2
+        y = max(0, min(y, sh - H))
+        panel["win"].geometry(f"{W}x{H}+{x}+{y}")
+
+    def show_panel(zone):
+        ensure_panel()
+        th = theme()
+        bucket = bucket_for(zone)
+        label = {"claude": "Claude Code", "codex": "Codex", "combined": "全部合计"}[zone]
+        head_color = {"claude": th["claude"], "codex": th["codex"], "combined": th["fg"]}[zone]
+
+        types = [k for k in TYPE_KEYS if nn(bucket.get(k)) > 0]
+        denom = type_sum(bucket) or 1
+
+        W, pad = 246, 14
+        header_h, row_h, foot_h = 64, 30, 62
+        H = header_h + row_h * max(1, len(types)) + foot_h
+
+        pcv = panel["canvas"]
+        pcv.config(width=W, height=H, bg=th["face"])
+        pcv.delete("all")
+        pcv.create_rectangle(1, 1, W - 1, H - 1, outline=th["track"], width=1)
+
+        pcv.create_text(pad, 16, text=label, anchor="w", fill=head_color,
+                        font=("Segoe UI", 12, "bold"))
+        pcv.create_text(pad, 38, text="含缓存总数", anchor="w", fill=th["dim"],
+                        font=("Segoe UI", 9))
+        pcv.create_text(W - pad, 38, text=f"{bucket['total']:,}", anchor="e",
+                        fill=th["fg"], font=("Consolas", 10, "bold"))
+        pcv.create_text(pad, 54, text="不含缓存读取", anchor="w", fill=th["dim"],
+                        font=("Segoe UI", 9))
+        pcv.create_text(W - pad, 54, text=f"{without_cached_read(bucket):,}", anchor="e",
+                        fill=th["fg"], font=("Consolas", 10))
+
+        y = header_h
+        bar_w = W - 2 * pad
+        if not types:
+            pcv.create_text(W / 2, y + row_h / 2, text="暂无数据", fill=th["dim"],
+                            font=("Segoe UI", 10))
+        for k in types:
+            v = nn(bucket.get(k))
+            pct = v / denom
+            color = TYPE_META[k]["color"]
+            pcv.create_rectangle(pad, y + 4, pad + 10, y + 14, fill=color, outline=color)
+            pcv.create_text(pad + 18, y + 9,
+                            text=f"{TYPE_META[k]['cn']} {pct * 100:.0f}%", anchor="w",
+                            fill=th["fg"], font=("Segoe UI", 10))
+            pcv.create_text(W - pad, y + 9, text=f"{v:,}", anchor="e",
+                            fill=th["fg"], font=("Consolas", 10))
+            # 占比细条：一眼看出各成分占比
+            pcv.create_rectangle(pad, y + 19, pad + bar_w, y + 22,
+                                 fill=th["track"], outline=th["track"])
+            pcv.create_rectangle(pad, y + 19, pad + bar_w * pct, y + 22,
+                                 fill=color, outline=color)
+            y += row_h
+
+        # ---- 底部分析 ----
+        inp = nn(bucket.get("input"))
+        cr = nn(bucket.get("cached_read"))
+        cc = nn(bucket.get("cache_create"))
+        events = nn(bucket.get("events"))
+        in_side = inp + cr + cc
+        hit = cr / in_side if in_side > 0 else 0
+        avg = nn(bucket.get("total")) / events if events > 0 else 0
+
+        pcv.create_line(pad, y + 6, W - pad, y + 6, fill=th["track"])
+        pcv.create_text(pad, y + 22, anchor="w", fill=th["dim"], font=("Segoe UI", 9),
+                        text=f"缓存命中率 {hit * 100:.0f}%  ·  缓存读省下 {fmt_k(cr)}")
+        pcv.create_text(pad, y + 40, anchor="w", fill=th["dim"], font=("Segoe UI", 9),
+                        text=f"事件 {events} 次  ·  均次 {fmt_k(int(avg))}")
+
+        place_panel(W, H)
+        panel["win"].deiconify()
+        panel["win"].lift()
+
     # ---- 数据刷新（后台线程扫描，主线程更新 UI）----
     def apply_result(r):
-        cs, xs = r["claude_sum"], r["codex_sum"]
-        state["claude_total"] = cs["total"]
-        state["codex_total"] = xs["total"]
+        state["claude"] = r["claude_sum"]
+        state["codex"] = r["codex_sum"]
         state["at"] = r["at"]
         state["rl"] = r["codex"]["rate_limit"]
         state["err"] = None
         draw()
+        if hover["zone"]:
+            show_panel(hover["zone"])
         build_menu()
 
     scanning = {"on": False}

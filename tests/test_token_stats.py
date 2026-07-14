@@ -110,14 +110,14 @@ class AdapterTests(unittest.TestCase):
             "cached_input_tokens": 2,
             "output_tokens": 3,
             "reasoning_output_tokens": 1,
-            "total_tokens": 16,
+            "total_tokens": 13,
         }
         second = {
             "input_tokens": 15,
             "cached_input_tokens": 4,
             "output_tokens": 8,
             "reasoning_output_tokens": 2,
-            "total_tokens": 29,
+            "total_tokens": 23,
         }
         reset = {
             "input_tokens": 2,
@@ -138,8 +138,11 @@ class AdapterTests(unittest.TestCase):
         result = token_stats.scan_codex(str(self.root), days=1)
         summary = token_stats.sum_window(result["by_date"])
 
-        self.assertEqual(summary["total"], 32)
+        self.assertEqual(summary["total"], 26)
         self.assertEqual(summary["input"], 17)
+        self.assertEqual(summary["cached_read"], 4)
+        self.assertEqual(summary["output"], 9)
+        self.assertEqual(summary["reasoning"], 2)
         self.assertEqual(summary["events"], 3)
         self.assertEqual(result["rate_limit"]["used_percent"], 12)
         self.assertTrue(any("cumulative-reset" in item for item in result["warnings"]))
@@ -153,6 +156,59 @@ class UtilityTests(unittest.TestCase):
         for value in (-1, 2.5, True, "3", None):
             with self.subTest(value=value):
                 self.assertEqual(token_stats.nn(value), 0)
+
+    def test_codex_display_components_are_mutually_exclusive(self):
+        raw = {
+            "input": 100,
+            "cached_read": 80,
+            "cache_create": 0,
+            "output": 40,
+            "reasoning": 10,
+            "total": 140,
+            "events": 2,
+        }
+
+        display = token_stats.display_bucket("codex", raw)
+
+        self.assertEqual(display["input"], 20)
+        self.assertEqual(display["cached_read"], 80)
+        self.assertEqual(display["output"], 30)
+        self.assertEqual(display["reasoning"], 10)
+        self.assertEqual(token_stats.component_sum(display), display["total"])
+        self.assertEqual(token_stats.without_cached_read(display), 60)
+
+    def test_combined_display_keeps_both_total_definitions(self):
+        claude = token_stats.display_bucket(
+            "claude",
+            {
+                "input": 10,
+                "cached_read": 50,
+                "cache_create": 20,
+                "output": 5,
+                "reasoning": 0,
+                "total": 85,
+                "events": 1,
+            },
+        )
+        codex = token_stats.display_bucket(
+            "codex",
+            {
+                "input": 100,
+                "cached_read": 80,
+                "cache_create": 0,
+                "output": 40,
+                "reasoning": 10,
+                "total": 140,
+                "events": 2,
+            },
+        )
+
+        combined = token_stats.merge_buckets(claude, codex)
+
+        self.assertEqual(combined["total"], 225)
+        self.assertEqual(combined["cached_read"], 130)
+        self.assertEqual(token_stats.component_sum(combined), combined["total"])
+        self.assertEqual(token_stats.without_cached_read(combined), 95)
 
     def test_positive_int_rejects_zero(self):
         self.assertEqual(token_stats.positive_int("7"), 7)
