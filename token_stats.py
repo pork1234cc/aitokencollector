@@ -414,6 +414,12 @@ def gui_main(cfg):
     RING_WIDTH = 14      # 外环厚度
     KEY_COLOR = "#FE01FE"  # 窗口透明色键（不与任何主题色重复）
 
+    EDGE_THRESHOLD = 20      # 拖动松手时判定"贴边"的距离（像素）
+    EDGE_HIDE_DELAY_MS = 1500  # 鼠标离开后延迟多久开始隐藏
+    EDGE_VISIBLE_PX = 6      # 隐藏后露出的细边宽度
+    EDGE_ANIM_INTERVAL_MS = 15  # 滑动动画帧间隔
+    EDGE_ANIM_STEP_PX = 10   # 滑动动画每帧位移
+
     def theme():
         return THEMES.get(cfg.get("theme", "dark"), THEMES["dark"])
 
@@ -433,6 +439,9 @@ def gui_main(cfg):
     canvas.pack()
 
     state = {"claude_total": 0, "codex_total": 0, "at": "--", "rl": None, "err": None}
+
+    # 贴边自动隐藏状态：edge 为贴住的屏幕边（拖动松手时判定），非贴边时为 None
+    edge_state = {"edge": None, "hidden": False, "hide_timer": None, "anim_job": None}
 
     def fmt_k(n):
         if n >= 1_000_000:
@@ -485,6 +494,28 @@ def gui_main(cfg):
             canvas.create_text(cx, cx + 34, text="⚠ 错误", fill="#ff5555",
                                 font=("Segoe UI", 8))
 
+        if edge_state["hidden"] and edge_state["edge"]:
+            draw_edge_handle(th, c, cx)
+
+    # ---- 贴边隐藏时露出的细条把手（保证透明窗口下仍有可悬停区域）----
+    def draw_edge_handle(th, c, cx):
+        L = EDGE_VISIBLE_PX
+        HANDLE_LEN = 40
+        bar = th["claude"]
+        edge = edge_state["edge"]
+        if edge == "left":
+            canvas.create_rectangle(c - L, cx - HANDLE_LEN / 2, c, cx + HANDLE_LEN / 2,
+                                     fill=bar, outline=bar)
+        elif edge == "right":
+            canvas.create_rectangle(0, cx - HANDLE_LEN / 2, L, cx + HANDLE_LEN / 2,
+                                     fill=bar, outline=bar)
+        elif edge == "top":
+            canvas.create_rectangle(cx - HANDLE_LEN / 2, c - L, cx + HANDLE_LEN / 2, c,
+                                     fill=bar, outline=bar)
+        elif edge == "bottom":
+            canvas.create_rectangle(cx - HANDLE_LEN / 2, 0, cx + HANDLE_LEN / 2, L,
+                                     fill=bar, outline=bar)
+
     # ---- 拖动（仅圆盘可见区域可触发，透明区域自动穿透）----
     drag = {"x": 0, "y": 0}
 
@@ -501,11 +532,102 @@ def gui_main(cfg):
     def on_release(_):
         cfg["x"], cfg["y"] = root.winfo_x(), root.winfo_y()
         save_config(cfg)
+        cancel_hide_timer()
+        cancel_anim()
+        edge_state["hidden"] = False
+        edge_state["edge"] = detect_edge()
+        draw()
 
     canvas.bind("<Button-1>", on_press)
     canvas.bind("<B1-Motion>", on_move)
     canvas.bind("<ButtonRelease-1>", on_release)
     canvas.bind("<Double-Button-1>", lambda e: refresh_now())
+
+    # ---- 贴边自动隐藏：拖到屏幕边缘松手后吸附，鼠标离开延迟滑出，移入再滑回 ----
+    def detect_edge():
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        x, y = root.winfo_x(), root.winfo_y()
+        if x <= EDGE_THRESHOLD:
+            return "left"
+        if x + DIAMETER >= sw - EDGE_THRESHOLD:
+            return "right"
+        if y <= EDGE_THRESHOLD:
+            return "top"
+        if y + DIAMETER >= sh - EDGE_THRESHOLD:
+            return "bottom"
+        return None
+
+    def cancel_hide_timer():
+        if edge_state["hide_timer"] is not None:
+            root.after_cancel(edge_state["hide_timer"])
+            edge_state["hide_timer"] = None
+
+    def cancel_anim():
+        if edge_state["anim_job"] is not None:
+            root.after_cancel(edge_state["anim_job"])
+            edge_state["anim_job"] = None
+
+    def slide_to(target_x, target_y, on_done=None):
+        cancel_anim()
+
+        def step():
+            cur_x, cur_y = root.winfo_x(), root.winfo_y()
+            dx, dy = target_x - cur_x, target_y - cur_y
+            if abs(dx) <= EDGE_ANIM_STEP_PX and abs(dy) <= EDGE_ANIM_STEP_PX:
+                root.geometry(f"+{target_x}+{target_y}")
+                edge_state["anim_job"] = None
+                if on_done:
+                    on_done()
+                return
+            nx = cur_x + max(-EDGE_ANIM_STEP_PX, min(EDGE_ANIM_STEP_PX, dx))
+            ny = cur_y + max(-EDGE_ANIM_STEP_PX, min(EDGE_ANIM_STEP_PX, dy))
+            root.geometry(f"+{nx}+{ny}")
+            edge_state["anim_job"] = root.after(EDGE_ANIM_INTERVAL_MS, step)
+
+        step()
+
+    def begin_hide():
+        edge_state["hide_timer"] = None
+        edge = edge_state["edge"]
+        if not edge or edge_state["hidden"]:
+            return
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        x, y = root.winfo_x(), root.winfo_y()
+        offset = DIAMETER - EDGE_VISIBLE_PX
+        target = {
+            "left": (-offset, y),
+            "right": (sw - EDGE_VISIBLE_PX, y),
+            "top": (x, -offset),
+            "bottom": (x, sh - EDGE_VISIBLE_PX),
+        }[edge]
+
+        def done():
+            edge_state["hidden"] = True
+            draw()
+
+        slide_to(*target, on_done=done)
+
+    def begin_show():
+        edge_state["hidden"] = False
+        draw()
+        slide_to(int(cfg["x"]), int(cfg["y"]))
+
+    def start_hide_timer():
+        if not edge_state["edge"] or edge_state["hidden"]:
+            return
+        cancel_hide_timer()
+        edge_state["hide_timer"] = root.after(EDGE_HIDE_DELAY_MS, begin_hide)
+
+    def on_canvas_enter(_):
+        cancel_hide_timer()
+        if edge_state["hidden"]:
+            begin_show()
+
+    def on_canvas_leave(_):
+        start_hide_timer()
+
+    canvas.bind("<Enter>", on_canvas_enter)
+    canvas.bind("<Leave>", on_canvas_leave)
 
     # ---- 数据刷新（后台线程扫描，主线程更新 UI）----
     def apply_result(r):
